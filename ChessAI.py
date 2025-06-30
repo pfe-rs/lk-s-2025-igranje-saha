@@ -1,8 +1,9 @@
 from MCTS import *
 from TrainingDataCollector import *
 from TrainingDataLoader import *
+from OpeningBook import *
 
-MAX_MOVES = 200
+MAX_MOVES = 20
 
 class ChessAI:
     """
@@ -10,7 +11,7 @@ class ChessAI:
     """
     
     def __init__(self, model, c_puct: float = 1.0, num_simulations: int = 800, 
-                 stochastic_selection: bool = False, data_collector: TrainingDataCollector = None):
+                 stochastic_selection: bool = False, data_collector: TrainingDataCollector = None, opening_book_file: str = None):
         """
         Initialize Chess AI.
         
@@ -24,17 +25,25 @@ class ChessAI:
         self.mcts = MCTS(model, c_puct, stochastic_selection)
         self.num_simulations = num_simulations
         self.data_collector = data_collector
-    
-    def get_best_move(self, board: chess.Board) -> chess.Move:
-        """
-        Get the best move for the current position.
+
+        self.opening_book = OpeningBook()
         
-        Args:
-            board: Current chess position
-            
-        Returns:
-            chess.Move: Best move found
-        """
+        if opening_book_file and os.path.exists(opening_book_file):
+            self.opening_book.load_book(opening_book_file)
+        else:
+            print("No opening book loaded. Build one first!")
+    
+    def get_best_move(self, fen: str, move_number: int) -> chess.Move:
+        """Get the best move using opening book or neural network."""
+        # Try opening book first
+        board = chess.Board(fen)
+        book_move = self.opening_book.get_book_move(fen, move_number)
+        if book_move:
+            print(f"Opening book move: {book_move}")
+            return board.parse_san(book_move)
+        
+        # Fall back to minimax
+        print("Using neural network algorithm")
         root_node = create_root_node(board)
         best_edge = self.mcts.search(root_node, self.num_simulations)
         return best_edge.move
@@ -77,14 +86,15 @@ class ChessAI:
         if opponent_ai is None:
             opponent_ai = self  # Self-play
         
-        move_count = 0
-        while not board.is_game_over() and move_count < max_moves:
+        move_count = 1
+        while not board.is_game_over() and move_count <= max_moves:
             print(move_count)
             # Choose which AI makes the move
             current_ai = self if board.turn == chess.WHITE else opponent_ai
             
             # Get move with probabilities for training data
             move, move_probs, _ = current_ai.get_move_with_analysis(board, temperature=1.0)
+            move = current_ai.get_best_move(board.fen(), (move_count + 1) // 2)
             
             # Record move and probabilities
             moves.append(move)
@@ -166,36 +176,3 @@ class ChessAI:
         loader = TrainingDataLoader(self.data_collector.save_path)
         final_stats = loader.get_data_stats()
         print(f"Final training data stats: {final_stats}")
-
-
-# Example usage with training data generation
-def example_usage_with_training():
-    """
-    Example of how to use the Chess AI with training data generation.
-    """
-    # Assuming you have a trained model class like this:
-    class YourTrainedModel:
-        def predict(self, fen: str) -> tuple[float, dict]:
-            """
-            Your model's prediction method.
-            
-            Args:
-                fen: Chess position in FEN notation
-                
-            Returns:
-                tuple: (position_value, move_probabilities_dict)
-            """
-            # Your model implementation here
-            # This should return:
-            # - position_value: float between -1 and 1
-            # - move_probabilities: dict mapping chess.Move objects to probabilities
-            
-            # Placeholder implementation
-            board = chess.Board(fen)
-            legal_moves = list(board.legal_moves)
-            
-            # Dummy values for example
-            value = 0.0  # Replace with actual model output
-            move_probs = {move: 1.0/len(legal_moves) for move in legal_moves}  # Uniform probs
-            
-            return value, move_probs

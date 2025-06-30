@@ -109,6 +109,6 @@ print(f"Policy output value: {policy_output}")
 print(f"Value output value: {value_output}")
 
 train_collector = TrainingDataCollector()
-chess_ai = ChessAI(model=model, c_puct=1.0, num_simulations=15, stochastic_selection=True, data_collector=train_collector)
+chess_ai = ChessAI(model=model, c_puct=1.0, num_simulations=10, stochastic_selection=True, data_collector=train_collector, opening_book_file='chess_opening_book.json')
 
 chess_ai.generate_training_data(num_games=1)
