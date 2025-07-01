@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import chess
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Set
 import os
 
 class ClippedReLU(nn.Module):
@@ -60,14 +60,14 @@ class NNUEFeatures:
                 
             # STM perspective feature
             stm_piece_idx = NNUEFeatures.piece_to_index(piece.piece_type, piece.color == stm)
-            stm_feature_idx = stm_king * 10 * 64 + stm_piece_idx * 64 + square
+            stm_feature_idx = stm_king * (10 * 64) + stm_piece_idx * 64 + square
             stm_features[stm_feature_idx] = 1.0
             
             # Opponent perspective feature (mirrored)
             mirrored_square = NNUEFeatures.mirror_square(square)
             opponent_piece_idx = NNUEFeatures.piece_to_index(piece.piece_type, piece.color != stm)
             opponent_king_mirror = NNUEFeatures.mirror_square(opponent_king)
-            opponent_feature_idx = opponent_king_mirror * 10 * 64 + opponent_piece_idx * 64 + mirrored_square
+            opponent_feature_idx = opponent_king_mirror * (10 * 64) + opponent_piece_idx * 64 + mirrored_square
             opponent_features[opponent_feature_idx] = 1.0
             
         return stm_features, opponent_features
@@ -142,7 +142,7 @@ class NNUENetwork(nn.Module):
         self.relu1 = ClippedReLU()
         
         # Hidden layers (8-bit)
-        self.hidden1 = SIMDLinear(first_hidden, second_hidden, bits=8)
+        self.hidden1 = SIMDLinear(first_hidden * 2, second_hidden, bits=8)  # Input is concatenated output
         self.relu2 = ClippedReLU()
         
         self.hidden2 = SIMDLinear(second_hidden, second_hidden, bits=8)
@@ -171,7 +171,7 @@ class NNUENetwork(nn.Module):
         x = self.relu3(self.hidden2(x))
         x = self.output_layer(x)
         
-        return x * 100  # Scale to centipawns
+        return x
 
 class ChessDataset(Dataset):
     """
@@ -358,7 +358,7 @@ class NNUEEngine:
             
             evaluation = self.model(stm_tensor, opponent_tensor)
             
-        return evaluation.item()
+        return evaluation.item()  # Already in centipawns
     
     def search(self, board: chess.Board, depth: int = 4) -> Tuple[chess.Move, float]:
         """Simple minimax search with alpha-beta pruning"""
@@ -366,45 +366,41 @@ class NNUEEngine:
             if depth == 0 or board.is_game_over():
                 return self.evaluate_position(board)
             
-            if maximizing:
-                max_eval = float('-inf')
-                for move in board.legal_moves:
-                    board.push(move)
-                    eval_score = minimax(board, depth - 1, alpha, beta, False)
-                    board.pop()
-                    max_eval = max(max_eval, eval_score)
+            best_eval = float('-inf') if maximizing else float('inf')
+            
+            for move in board.legal_moves:
+                board.push(move)
+                eval_score = minimax(board, depth - 1, alpha, beta, not maximizing)
+                board.pop()
+                
+                if maximizing:
+                    if eval_score > best_eval:
+                        best_eval = eval_score
                     alpha = max(alpha, eval_score)
-                    if beta <= alpha:
-                        break  # Alpha-beta pruning
-                return max_eval
-            else:
-                min_eval = float('inf')
-                for move in board.legal_moves:
-                    board.push(move)
-                    eval_score = minimax(board, depth - 1, alpha, beta, True)
-                    board.pop()
-                    min_eval = min(min_eval, eval_score)
+                else:
+                    if eval_score < best_eval:
+                        best_eval = eval_score
                     beta = min(beta, eval_score)
-                    if beta <= alpha:
-                        break  # Alpha-beta pruning
-                return min_eval
+                
+                if beta <= alpha:
+                    break
+            
+            return best_eval
         
+        # Determine if we're maximizing or minimizing
+        maximizing = board.turn == chess.WHITE
+        best_score = minimax(board, depth, float('-inf'), float('inf'), maximizing)
+        
+        # Find best move
         best_move = None
-        best_score = float('-inf') if board.turn else float('inf')
-        
         for move in board.legal_moves:
             board.push(move)
-            score = minimax(board, depth - 1, float('-inf'), float('inf'), not board.turn)
+            score = self.evaluate_position(board)
             board.pop()
             
-            if board.turn:  # White to move
-                if score > best_score:
-                    best_score = score
-                    best_move = move
-            else:  # Black to move
-                if score < best_score:
-                    best_score = score
-                    best_move = move
+            if (maximizing and abs(score - best_score) < 0.01) or (not maximizing and abs(score - best_score) < 0.01):
+                best_move = move
+                break
         
         return best_move, best_score
 
@@ -417,11 +413,11 @@ def load_training_data(file_path: str) -> Tuple[List[str], List[float]]:
     
     with open(file_path, 'r') as f:
         for line in f:
-            parts = line.strip().split('\t')  # Assuming tab-separated
+            parts = line.strip().split()
             if len(parts) >= 2:
-                fen = parts[0]
+                fen = ' '.join(parts[:-1])
                 try:
-                    eval_score = float(parts[1])
+                    eval_score = float(parts[-1])
                     positions.append(fen)
                     evaluations.append(eval_score)
                 except ValueError:
@@ -499,6 +495,7 @@ def main():
         first_hidden=HIDDEN_SIZE,
         second_hidden=32
     )
+    model.to(DEVICE)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
