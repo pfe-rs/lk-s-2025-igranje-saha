@@ -5,10 +5,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import chess
 import chess.engine
-from typing import List, Tuple, Optional
-import struct
+from typing import List, Tuple, Optional, Set
 import os
-from numba import jit, njit
+import struct
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -32,18 +31,56 @@ class NNUEFeatures:
     FEATURE_SIZE = SQUARES * (PIECE_TYPES * COLORS) * SQUARES  # 64 * 10 * 64 = 40960
     
     @staticmethod
-    @njit
     def piece_to_index(piece_type: int, color: int) -> int:
         """Convert piece type and color to feature index (excluding kings)"""
-        if piece_type == 6:  # King
-            return -1  # Kings are not included in features
+        if piece_type == chess.KING:  # King (value 6)
+            return -1
         return (piece_type - 1) + (0 if color else 5)  # 0-4 for white, 5-9 for black
     
+    @staticmethod
+    def get_halfkp_active_indices(board: chess.Board) -> Tuple[Set[int], Set[int]]:
+        """
+        Extract HalfKP feature indices for both perspectives (white and black)
+        Returns: (white_active_indices, black_active_indices)
+        """
+        white_active = set()
+        black_active = set()
+        
+        # Find king positions
+        white_king_sq = board.king(chess.WHITE)
+        black_king_sq = board.king(chess.BLACK)
+        
+        if white_king_sq is None or black_king_sq is None:
+            return white_active, black_active
+        
+        # Process each piece on the board (excluding kings)
+        for square in chess.SQUARES:
+            piece = board.piece_at(square)
+            if piece is None or piece.piece_type == chess.KING:
+                continue
+                
+            piece_idx = NNUEFeatures.piece_to_index(piece.piece_type, piece.color)
+            if piece_idx == -1:
+                continue
+                
+            # White perspective feature
+            white_feature_idx = white_king_sq * 10 * 64 + piece_idx * 64 + square
+            white_active.add(white_feature_idx)
+            
+            # Black perspective feature (mirrored)
+            black_square = chess.square_mirror(square)
+            black_king_mirror = chess.square_mirror(black_king_sq)
+            # For black perspective, flip the piece color in the encoding
+            black_piece_idx = NNUEFeatures.piece_to_index(piece.piece_type, not piece.color)
+            black_feature_idx = black_king_mirror * 10 * 64 + black_piece_idx * 64 + black_square
+            black_active.add(black_feature_idx)
+            
+        return white_active, black_active
+
     @staticmethod
     def get_halfkp_features(board: chess.Board) -> Tuple[np.ndarray, np.ndarray]:
         """
         Extract HalfKP features for both perspectives (white and black)
-        Features: King square (64) × Non-king pieces (10) × Piece square (64)
         Returns: (white_features, black_features)
         """
         white_features = np.zeros(NNUEFeatures.FEATURE_SIZE, dtype=np.float32)
@@ -60,12 +97,13 @@ class NNUEFeatures:
         for square in chess.SQUARES:
             piece = board.piece_at(square)
             if piece is None or piece.piece_type == chess.KING:
-                continue  # Skip empty squares and kings
+                continue
                 
             piece_idx = NNUEFeatures.piece_to_index(piece.piece_type, piece.color)
-            
+            if piece_idx == -1:
+                continue
+                
             # White perspective feature
-            # Formula: king_square * 10 * 64 + piece_type * 64 + piece_square
             white_feature_idx = white_king_sq * 10 * 64 + piece_idx * 64 + square
             white_features[white_feature_idx] = 1.0
             
@@ -78,10 +116,10 @@ class NNUEFeatures:
             black_features[black_feature_idx] = 1.0
             
         return white_features, black_features
-    
+
 # Pure PyTorch alternative (no NumPy conversion needed)
-class PureTorchSIMDLinear(nn.Module):
-    """Pure PyTorch implementation avoiding NumPy compatibility issues"""
+class SIMDLinear(nn.Module):
+    """Hidden layer implementation"""
     def __init__(self, input_size, output_size, bits=16):
         super().__init__()
         self.input_size = input_size
@@ -134,32 +172,38 @@ class PureTorchSIMDLinear(nn.Module):
             return result / self.scale_factor
 
 class NNUENetwork(nn.Module):
-    """Pure PyTorch NNUE avoiding NumPy compatibility issues"""
-    def __init__(self, input_size=81920, first_hidden=512, second_hidden=32):
+    """NNUE implementation"""
+    def __init__(self, feature_size=40960, first_hidden=512, second_hidden=32):
         super().__init__()
+        self.feature_size = feature_size
+        self.first_hidden = first_hidden
+        self.second_hidden = second_hidden
         
         # First layer - mirrored weights (16-bit)
-        self.input_layer1 = PureTorchSIMDLinear(input_size // 2, first_hidden // 2, bits=16)
-        self.input_layer2 = PureTorchSIMDLinear(input_size // 2, first_hidden // 2, bits=16)
+        self.input_layer1 = SIMDLinear(feature_size, first_hidden // 2, bits=16)
+        self.input_layer2 = SIMDLinear(feature_size, first_hidden // 2, bits=16)
         
         # Share weights between the two halves
         self.input_layer2.weight_float = self.input_layer1.weight_float
+        self.input_layer2.bias_float = self.input_layer1.bias_float
         
         self.relu1 = ClippedReLU()
         
         # Hidden layers (8-bit)
-        self.hidden1 = PureTorchSIMDLinear(first_hidden, second_hidden, bits=8)
+        self.hidden1 = SIMDLinear(first_hidden, second_hidden, bits=8)
         self.relu2 = ClippedReLU()
         
-        self.hidden2 = PureTorchSIMDLinear(second_hidden, second_hidden, bits=8)
+        self.hidden2 = SIMDLinear(second_hidden, second_hidden, bits=8)
         self.relu3 = ClippedReLU()
         
         # Output layer
-        self.output_layer = PureTorchSIMDLinear(second_hidden, 1, bits=8)
+        self.output_layer = SIMDLinear(second_hidden, 1, bits=8)
 
         # Accumulator for efficient incremental updates
         self.register_buffer('accumulator', torch.zeros(1, first_hidden))
         self.accumulator_valid = False
+        self.current_white_active = set()
+        self.current_black_active = set()
     
     def quantize_all_weights(self):
         """Quantize all layers"""
@@ -173,38 +217,56 @@ class NNUENetwork(nn.Module):
         """Reset the accumulator for incremental updates"""
         self.accumulator.zero_()
         self.accumulator_valid = False
+        self.current_white_active = set()
+        self.current_black_active = set()
     
-    def incremental_update(self, added_features, removed_features):
-        """
-        Efficiently update the accumulator based on piece moves
-        Only updates the changed features instead of recomputing everything
-        """
+    def initialize_accumulator(self, white_active: Set[int], black_active: Set[int]):
+        self.accumulator.zero_()
+        
+        # Process white features
+        white_indices = list(white_active)
+        if white_indices:
+            white_tensor = torch.LongTensor(list(white_active))
+            self.accumulator += self.input_layer1.weight_float[:, white_tensor].sum(dim=1)
+        
+        # Process black features
+        black_indices = list(black_active)
+        if black_indices:
+            black_tensor = torch.LongTensor(list(black_active))
+            self.accumulator += self.input_layer2.weight_float[:, black_tensor].sum(dim=1)
+        
+        # Add biases
+        bias = self.input_layer1.bias_float + self.input_layer2.bias_float
+        self.accumulator += bias.unsqueeze(0)
+        
+        self.accumulator_valid = True
+        self.current_white_active = white_active
+        self.current_black_active = black_active
+    
+    def incremental_update(self, added_white: Set[int], added_black: Set[int], 
+                          removed_white: Set[int], removed_black: Set[int]) -> bool:
         if not self.accumulator_valid:
             return False
         
-        # Add new features
-        for feature_idx in added_features:
-            if feature_idx < self.input_layer.half_input:
-                # First half
-                self.accumulator[0, :self.input_layer.half_output] += \
-                    self.input_layer.weight_float[:, feature_idx]
-            else:
-                # Second half
-                mapped_idx = feature_idx - self.input_layer.half_input
-                self.accumulator[0, self.input_layer.half_output:] += \
-                    self.input_layer.weight_float[:, mapped_idx]
+        # Update white features
+        if added_white:
+            add_tensor = torch.LongTensor(list(added_white))
+            self.accumulator += self.input_layer1.weight_float[:, add_tensor].sum(dim=1)
+        if removed_white:
+            remove_tensor = torch.LongTensor(list(removed_white))
+            self.accumulator -= self.input_layer1.weight_float[:, remove_tensor].sum(dim=1)
         
-        # Remove old features
-        for feature_idx in removed_features:
-            if feature_idx < self.input_layer.half_input:
-                # First half
-                self.accumulator[0, :self.input_layer.half_output] -= \
-                    self.input_layer.weight_float[:, feature_idx]
-            else:
-                # Second half
-                mapped_idx = feature_idx - self.input_layer.half_input
-                self.accumulator[0, self.input_layer.half_output:] -= \
-                    self.input_layer.weight_float[:, mapped_idx]
+        # Update black features
+        if added_black:
+            add_tensor = torch.LongTensor(list(added_black))
+            self.accumulator += self.input_layer2.weight_float[:, add_tensor].sum(dim=1)
+        if removed_black:
+            remove_tensor = torch.LongTensor(list(removed_black))
+            self.accumulator -= self.input_layer2.weight_float[:, remove_tensor].sum(dim=1)
+        
+        # Update active feature sets
+        self.current_white_active = (self.current_white_active - removed_white) | added_white
+        self.current_black_active = (self.current_black_active - removed_black) | added_black
         
         return True
     
@@ -214,23 +276,19 @@ class NNUENetwork(nn.Module):
         Much faster for position evaluation during search
         """
         if not self.accumulator_valid:
-            raise ValueError("Accumulator not valid. Call forward() first or update incrementally.")
+            raise ValueError("Accumulator not valid. Call initialize_accumulator() first.")
         
-        x = self.relu1(self.accumulator + self.input_layer.bias_float)
+        x = self.relu1(self.accumulator)
         x = self.relu2(self.hidden1(x))
         x = self.relu3(self.hidden2(x))
         x = self.output_layer(x)
         
         return x
     
-    def forward(self, x):
-        # Split input
-        x1 = x[:, :x.shape[1]//2]
-        x2 = x[:, x.shape[1]//2:]
-        
+    def forward(self, white_features, black_features):
         # Process both halves
-        out1 = self.input_layer1(x1)
-        out2 = self.input_layer2(x2)
+        out1 = self.input_layer1(white_features)
+        out2 = self.input_layer2(black_features)
         
         # Combine and continue
         x = torch.cat([out1, out2], dim=1)
@@ -260,9 +318,11 @@ class ChessDataset(Dataset):
         board = chess.Board(fen)
         white_features, black_features = NNUEFeatures.get_halfkp_features(board)
         
+        # Combine features into single tensor
+        features = np.concatenate([white_features, black_features])
+        
         return {
-            'white_features': torch.tensor(white_features, dtype=torch.float32),
-            'black_features': torch.tensor(black_features, dtype=torch.float32),
+            'features': torch.tensor(features, dtype=torch.float32),
             'evaluation': torch.tensor(evaluation, dtype=torch.float32)
         }
 
@@ -307,9 +367,13 @@ class NNUETrainer:
         num_batches = 0
         
         for batch in dataloader:
-            white_features = batch['white_features'].to(self.device)
-            black_features = batch['black_features'].to(self.device)
+            features = batch['features'].to(self.device)
             targets = batch['evaluation'].to(self.device).unsqueeze(1)
+            
+            # Split features into white and black perspectives
+            half_size = features.size(1) // 2
+            white_features = features[:, :half_size]
+            black_features = features[:, half_size:]
             
             # Zero gradients
             self.optimizer.zero_grad()
@@ -342,9 +406,12 @@ class NNUETrainer:
         
         with torch.no_grad():
             for batch in dataloader:
-                white_features = batch['white_features'].to(self.device)
-                black_features = batch['black_features'].to(self.device)
+                features = batch['features'].to(self.device)
                 targets = batch['evaluation'].to(self.device).unsqueeze(1)
+                
+                half_size = features.size(1) // 2
+                white_features = features[:, :half_size]
+                black_features = features[:, half_size:]
                 
                 outputs = self.model(white_features, black_features)
                 loss = self.criterion(outputs, targets)
@@ -399,70 +466,158 @@ class NNUEEngine:
     def __init__(self, model_path: str, device: str = 'cpu'):
         self.device = device
         self.model = NNUENetwork()
+        self.model.to(device)
         
         # Load trained model
         checkpoint = torch.load(model_path, map_location=device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.eval()
-        self.model.to(device)
+        self.model.quantize_all_weights()
         
-    def evaluate_position(self, board: chess.Board) -> float:
-        """Evaluate a chess position using NNUE"""
-        white_features, black_features = NNUEFeatures.get_halfkp_features(board)
+        # Initialize board state
+        self.current_board = None
+        self.current_white_active = set()
+        self.current_black_active = set()
+
+    def get_feature_changes(self, old_board: chess.Board, new_board: chess.Board) -> Tuple[Set[int], Set[int], Set[int], Set[int]]:
+        """Calculate feature differences between positions"""
+        old_white, old_black = NNUEFeatures.get_halfkp_active_indices(old_board)
+        new_white, new_black = NNUEFeatures.get_halfkp_active_indices(new_board)
         
+        added_white = new_white - old_white
+        removed_white = old_white - new_white
+        added_black = new_black - old_black
+        removed_black = old_black - new_black
+        
+        return added_white, added_black, removed_white, removed_black
+    
+    def set_position(self, board: chess.Board):
+        """Set the current board position and initialize accumulator"""
+        self.current_board = board.copy()
+        self.current_white_active, self.current_black_active = \
+            NNUEFeatures.get_halfkp_active_indices(board)
+        self.model.initialize_accumulator(
+            self.current_white_active, self.current_black_active
+        )
+    
+    def make_move(self, move: chess.Move):
+        old_board = self.current_board.copy()
+        self.current_board.push(move)
+        
+        added_white, added_black, removed_white, removed_black = \
+            self.get_feature_changes(old_board, self.current_board)
+        
+        self.model.incremental_update(
+            added_white, added_black,
+            removed_white, removed_black
+        )
+        
+        # Update current active features
+        self.current_white_active = (self.current_white_active - removed_white) | added_white
+        self.current_black_active = (self.current_black_active - removed_black) | added_black
+    
+    def unmake_move(self):
+        """Revert the last move"""
+        if self.current_board is None or len(self.current_board.move_stack) == 0:
+            return
+        
+        # Pop the move
+        self.current_board.pop()
+        
+        # Reinitialize from scratch since it's simpler
+        self.set_position(self.current_board)
+    
+    def evaluate_position(self) -> float:
+        """Evaluate current position using accumulator"""
         with torch.no_grad():
-            white_tensor = torch.tensor(white_features, dtype=torch.float32).unsqueeze(0).to(self.device)
-            black_tensor = torch.tensor(black_features, dtype=torch.float32).unsqueeze(0).to(self.device)
+            evaluation = self.model.forward_from_accumulator()
             
-            evaluation = self.model(white_tensor, black_tensor)
-            
-            # Convert to centipawns and flip for black to move
-            score = evaluation.item() * 100
-            if not board.turn:  # Black to move
-                score = -score
+        # Convert to centipawns and flip for black to move
+        score = evaluation.item() * 100
+        if not self.current_board.turn:  # Black to move
+            score = -score
                 
         return score
     
-    def search(self, board: chess.Board, depth: int = 4) -> Tuple[chess.Move, float]:
+    def search(self, depth: int = 4) -> Tuple[chess.Move, float]:
         """
-        Simple minimax search with alpha-beta pruning
+        Minimax search with alpha-beta pruning and incremental updates
         """
-        def minimax(board: chess.Board, depth: int, alpha: float, beta: float, maximizing: bool) -> float:
+        if self.current_board is None:
+            raise ValueError("Board position not set. Call set_position() first.")
+        
+        def minimax(board: chess.Board, depth: int, alpha: float, beta: float, 
+                   maximizing: bool, engine: NNUEEngine) -> float:
+            # Use incremental evaluation at leaf nodes
             if depth == 0 or board.is_game_over():
-                return self.evaluate_position(board)
+                return engine.evaluate_position()
             
-            if maximizing:
-                max_eval = float('-inf')
-                for move in board.legal_moves:
-                    board.push(move)
-                    eval_score = minimax(board, depth - 1, alpha, beta, False)
-                    board.pop()
-                    max_eval = max(max_eval, eval_score)
+            best_eval = float('-inf') if maximizing else float('inf')
+            
+            for move in board.legal_moves:
+                # Save current state
+                prev_white_active = engine.current_white_active
+                prev_black_active = engine.current_black_active
+                prev_accumulator = engine.model.accumulator.clone()
+                
+                # Make move and update incrementally
+                engine.make_move(move)
+                
+                # Recursive search
+                eval_score = minimax(
+                    board, depth - 1, alpha, beta, not maximizing, engine
+                )
+                
+                # Unmake move and restore state
+                engine.unmake_move()
+                engine.current_white_active = prev_white_active
+                engine.current_black_active = prev_black_active
+                engine.model.accumulator.copy_(prev_accumulator)
+                engine.model.accumulator_valid = True
+                
+                # Update best evaluation
+                if maximizing:
+                    best_eval = max(best_eval, eval_score)
                     alpha = max(alpha, eval_score)
-                    if beta <= alpha:
-                        break  # Alpha-beta pruning
-                return max_eval
-            else:
-                min_eval = float('inf')
-                for move in board.legal_moves:
-                    board.push(move)
-                    eval_score = minimax(board, depth - 1, alpha, beta, True)
-                    board.pop()
-                    min_eval = min(min_eval, eval_score)
+                else:
+                    best_eval = min(best_eval, eval_score)
                     beta = min(beta, eval_score)
-                    if beta <= alpha:
-                        break  # Alpha-beta pruning
-                return min_eval
-        
-        best_move = None
-        best_score = float('-inf') if board.turn else float('inf')
-        
-        for move in board.legal_moves:
-            board.push(move)
-            score = minimax(board, depth - 1, float('-inf'), float('inf'), not board.turn)
-            board.pop()
+                
+                # Alpha-beta pruning
+                if beta <= alpha:
+                    break
             
-            if board.turn:  # White to move
+            return best_eval
+        
+        # Perform search
+        best_move = None
+        best_score = float('-inf') if self.current_board.turn else float('inf')
+        
+        for move in self.current_board.legal_moves:
+            # Save current state
+            prev_white_active = self.current_white_active
+            prev_black_active = self.current_black_active
+            prev_accumulator = self.model.accumulator.clone()
+            
+            # Make move and update incrementally
+            self.make_move(move)
+            
+            # Evaluate position
+            score = minimax(
+                self.current_board, depth - 1, 
+                float('-inf'), float('inf'),
+                not self.current_board.turn, self
+            )
+            
+            # Unmake move and restore state
+            self.unmake_move()
+            self.current_white_active = prev_white_active
+            self.current_black_active = prev_black_active
+            self.model.accumulator.copy_(prev_accumulator)
+            self.model.accumulator_valid = True
+            
+            # Update best move
+            if self.current_board.turn:  # White to move
                 if score > best_score:
                     best_score = score
                     best_move = move
@@ -563,8 +718,8 @@ def main():
     print("Creating NNUE model...")
     model = NNUENetwork(
         feature_size=NNUEFeatures.FEATURE_SIZE,
-        hidden_size=HIDDEN_SIZE,
-        num_hidden_layers=2
+        first_hidden=HIDDEN_SIZE,
+        second_hidden=32
     )
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
