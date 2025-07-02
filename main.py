@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import pandas as pd
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import chess
@@ -404,63 +405,26 @@ class NNUEEngine:
         
         return best_move, best_score
 
-# Utility functions for data loading and preprocessing
-def load_training_data(file_path: str) -> Tuple[List[str], List[float]]:
-    """Load training data from file
-       Expected format: FEN evaluation"""
-    positions = []
-    evaluations = []
-    
-    with open(file_path, 'r') as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) >= 2:
-                fen = ' '.join(parts[:-1])
-                try:
-                    eval_score = float(parts[-1])
-                    positions.append(fen)
-                    evaluations.append(eval_score)
-                except ValueError:
-                    continue
-    
-    return positions, evaluations
+# Utility: load CSV
+def load_data_from_csv(train_csv: str, val_csv: str) -> Tuple[DataLoader, DataLoader]:
+    train_df = pd.read_csv(train_csv)
+    val_df = pd.read_csv(val_csv)
+    train_ds = ChessDataset(train_df)
+    val_ds = ChessDataset(val_df)
+    return train_ds, val_ds
 
-def create_data_loaders(positions: List[str], 
-                       evaluations: List[float],
-                       batch_size: int = 1024,
-                       train_split: float = 0.8,
-                       num_workers: int = 4) -> Tuple[DataLoader, DataLoader]:
-    """Create training and validation data loaders"""
-    
-    # Split data
-    total_size = len(positions)
-    train_size = int(total_size * train_split)
-    
-    train_positions = positions[:train_size]
-    train_evaluations = evaluations[:train_size]
-    val_positions = positions[train_size:]
-    val_evaluations = evaluations[train_size:]
-    
-    # Create datasets
-    train_dataset = ChessDataset(train_positions, train_evaluations)
-    val_dataset = ChessDataset(val_positions, val_evaluations)
-    
-    # Create data loaders
+def create_data_loaders(train_ds: Dataset,
+                        val_ds: Dataset,
+                        batch_size: int = 1024,
+                        num_workers: int = 4) -> Tuple[DataLoader, DataLoader]:
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available()
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=torch.cuda.is_available()
     )
     val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available()
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=torch.cuda.is_available()
     )
-    
     return train_loader, val_loader
 
 # Example usage and training script
@@ -476,16 +440,14 @@ def main():
     
     print(f"Using device: {DEVICE}")
     
-    # Load training data
-    print("Loading training data...")
-    positions, evaluations = load_training_data('training_data.txt')  # Replace with your file
-    print(f"Loaded {len(positions)} positions")
+    # Load data
+    print('Loading CSV data...')
+    train_ds, val_ds = load_data_from_csv('training.csv', 'validation.csv')
+    print(f'Train samples: {len(train_ds)}, Val samples: {len(val_ds)}')
     
-    # Create data loaders
-    print("Creating data loaders...")
+    # Build loaders
     train_loader, val_loader = create_data_loaders(
-        positions, evaluations, 
-        batch_size=BATCH_SIZE
+        train_ds, val_ds, batch_size=BATCH_SIZE
     )
     
     # Create model
